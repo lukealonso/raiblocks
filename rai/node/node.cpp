@@ -2288,6 +2288,22 @@ void rai::node::process_confirmed (std::shared_ptr <rai::block> confirmed_a)
     confirmed_a->visit (visitor);
 }
 
+void rai::node::request_reconfirmation (std::shared_ptr <rai::block> block_a)
+{
+	std::cout << "requesting reconfirmation for block: " << block_a->hash().to_string() << " root: " << block_a->root().to_string() << "\n";
+	{
+		rai::transaction transaction (store.environment, nullptr, true);
+		active.start (transaction, block_a);
+	}
+	network.broadcast_confirm_req(block_a);
+}
+
+bool rai::node::check_election_results (std::shared_ptr <rai::block> block_a, election_result& result)
+{
+	rai::transaction transaction (store.environment, nullptr, true);
+	return active.check_election_results (transaction, block_a, result);
+}
+
 void rai::node::process_message (rai::message & message_a, rai::endpoint const & sender_a)
 {
 	network_message_visitor visitor (*this, sender_a);
@@ -2755,11 +2771,21 @@ void rai::election::confirm_once (MDB_txn * transaction_a)
 	}
 }
 
+void rai::election::get_progress (MDB_txn * transaction_a, rai::election_result & result)
+{
+	auto tally_l (node.ledger.tally (transaction_a, votes));
+	assert (tally_l.size () > 0);
+	auto results(tally_l.begin());
+	result.winner = results->second->hash();
+	result.tally = rai::amount(results->first);
+}
+
 bool rai::election::have_quorum (MDB_txn * transaction_a)
 {
 	auto tally_l (node.ledger.tally (transaction_a, votes));
 	assert (tally_l.size () > 0);
-	auto result (tally_l.begin ()->first > quorum_threshold (transaction_a, node.ledger));
+	auto winner(tally_l.begin());
+	auto result (winner->first > quorum_threshold (transaction_a, node.ledger));
 	return result;
 }
 
@@ -2814,6 +2840,10 @@ void rai::active_transactions::announce_votes ()
 				// These blocks have reached the confirmation interval for forks
 				i->election->confirm_cutoff (transaction);
 				auto root_l (i->election->votes.id);
+				rai::election_history history;
+				history.root = i->root;
+				election_l->get_progress(transaction, history.result);
+				election_history.insert(history);
 				inactive.push_back (root_l);
 			}
 			else
@@ -2868,6 +2898,28 @@ void rai::active_transactions::start (MDB_txn * transaction_a, std::shared_ptr <
         auto election (std::make_shared <rai::election> (transaction_a, node, block_a, confirmation_action_a));
         roots.insert (rai::conflict_info {root, election, 0});
     }
+}
+
+bool rai::active_transactions::check_election_results (MDB_txn * transaction_a, std::shared_ptr <rai::block> block_a, rai::election_result & result)
+{
+	std::lock_guard <std::mutex> lock (mutex);
+    auto root (block_a->root ());
+    auto existing (roots.find (root));
+    if (existing != roots.end ())
+    {
+		existing->election->get_progress(transaction_a, result);
+		return false;
+    }
+	else
+	{
+		auto historical (election_history.find (root));
+		if (historical != election_history.end())
+		{
+			result = historical->result;
+			return false;
+		}
+	}
+	return true;
 }
 
 // Validate a vote and apply it to the current election if one exists

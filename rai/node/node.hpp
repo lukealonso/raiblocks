@@ -37,6 +37,12 @@ class variables_map;
 namespace rai
 {
 class node;
+class election_result
+{
+public:
+	rai::block_hash winner;
+	rai::amount tally;
+};
 class election : public std::enable_shared_from_this <rai::election>
 {
 	std::function <void (std::shared_ptr <rai::block>)> confirmation_action;
@@ -54,6 +60,8 @@ public:
 	void confirm_if_quorum (MDB_txn *);
 	// Confirmation method 2, settling time
 	void confirm_cutoff (MDB_txn *);
+	// Get the current tally and winner.
+	void get_progress (MDB_txn *, election_result& result);
     rai::uint128_t quorum_threshold (MDB_txn *, rai::ledger &);
 	rai::uint128_t minimum_threshold (MDB_txn *, rai::ledger &);
     rai::votes votes;
@@ -70,6 +78,12 @@ public:
 	// Number of announcements in a row for this fork
 	unsigned announcements;
 };
+class election_history
+{
+public:
+	rai::block_hash root;
+	rai::election_result result;
+};
 // Core class for determining concensus
 // Holds all active blocks i.e. recently added blocks that need confirmation
 class active_transactions
@@ -84,6 +98,7 @@ public:
 	bool active (rai::block const &);
 	void announce_votes ();
 	void stop ();
+	bool check_election_results (MDB_txn *, std::shared_ptr <rai::block>, election_result& result);
     boost::multi_index_container
 	<
 		rai::conflict_info,
@@ -92,6 +107,14 @@ public:
 			boost::multi_index::ordered_unique <boost::multi_index::member <rai::conflict_info, rai::block_hash, &rai::conflict_info::root>>
 		>
 	> roots;
+    boost::multi_index_container
+	<
+		rai::election_history,
+		boost::multi_index::indexed_by
+		<
+			boost::multi_index::ordered_unique <boost::multi_index::member <rai::election_history, rai::block_hash, &rai::election_history::root>>
+		>
+	> election_history;
     rai::node & node;
     std::mutex mutex;
 	// Maximum number of conflicts to vote on per interval, lowest root hash first
@@ -481,6 +504,8 @@ public:
     void stop ();
     std::shared_ptr <rai::node> shared ();
 	int store_version ();
+    void request_reconfirmation (std::shared_ptr <rai::block>);
+	bool check_election_results (std::shared_ptr <rai::block>, election_result& result);
     void process_confirmed (std::shared_ptr <rai::block>);
 	void process_message (rai::message &, rai::endpoint const &);
 	void process_active (std::shared_ptr <rai::block>);
