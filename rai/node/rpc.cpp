@@ -2906,14 +2906,16 @@ void rai::rpc_handler::check_election_results ()
 			if (!node.check_election_results (std::shared_ptr <rai::block>(move (block_l)), result))
 			{
 				boost::property_tree::ptree response_l;
-				response_l.put ("winner", result.winner.to_string());
 				response_l.put ("tally", result.tally.to_string());
+				response_l.put ("verified", (result.verified ? "yes" : "no"));
+				response_l.put ("ended", (result.ended ? "yes" : "no"));
 				response_l.put ("percent", (double)(result.tally.number() / (node.ledger.supply (transaction) / 1000)) / 10.0);
 				response (response_l);
 			}
 			else
 			{
-				error_response (response, "Election not found");
+        // don't send temporary election results to the user
+				error_response (response, "Election not-yet-confirmed");
 			}
 		}
 		else
@@ -4494,11 +4496,11 @@ void rai::rpc_handler::process_request ()
 		{
 			search_pending_all ();
 		}
-		else if (action == "request_reconfirmation")
+		else if (action == "reconfirm")
 		{
 			request_reconfirmation ();
 		}
-		else if (action == "check_election_results")
+		else if (action == "verify")
 		{
 			check_election_results ();
 		}
