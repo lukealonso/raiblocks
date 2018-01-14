@@ -82,7 +82,7 @@ public:
 	std::weak_ptr<rai::frontier_req_client> frontiers;
 	std::weak_ptr<rai::bulk_push_client> push;
 	std::deque<rai::pull_info> pulls;
-	std::vector<std::shared_ptr<rai::bootstrap_client>> idle;
+	std::deque<std::shared_ptr<rai::bootstrap_client>> idle;
 	std::atomic<unsigned> connections;
 	std::atomic<unsigned> pulling;
 	std::shared_ptr<rai::node> node;
@@ -135,12 +135,17 @@ public:
 	std::shared_ptr<rai::bootstrap_client> shared ();
 	void start_timeout ();
 	void stop_timeout ();
+	void stop ();
+	double blocks_rate() const;
 	std::shared_ptr<rai::node> node;
 	std::shared_ptr<rai::bootstrap_attempt> attempt;
 	boost::asio::ip::tcp::socket socket;
 	std::array<uint8_t, 200> receive_buffer;
 	rai::tcp_endpoint endpoint;
 	boost::asio::deadline_timer timeout;
+	std::chrono::steady_clock::time_point start_time;
+	std::atomic<int> block_count;
+	bool pending_stop;
 };
 class bulk_push_client : public std::enable_shared_from_this<rai::bulk_push_client>
 {

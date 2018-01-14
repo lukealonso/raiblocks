@@ -32,6 +32,8 @@ int constexpr rai::port_mapping::mapping_timeout;
 int constexpr rai::port_mapping::check_timeout;
 unsigned constexpr rai::active_transactions::announce_interval_ms;
 
+#define DISABLE_INCOMING 1
+
 rai::message_statistics::message_statistics () :
 keepalive (0),
 publish (0),
@@ -351,7 +353,9 @@ public:
 		++node.network.incoming.publish;
 		node.peers.contacted (sender, message_a.version_using);
 		node.peers.insert (sender, message_a.version_using);
+#if !DISABLE_INCOMING
 		node.process_active (message_a.block);
+#endif
 	}
 	void confirm_req (rai::confirm_req const & message_a) override
 	{
@@ -362,12 +366,14 @@ public:
 		++node.network.incoming.confirm_req;
 		node.peers.contacted (sender, message_a.version_using);
 		node.peers.insert (sender, message_a.version_using);
+#if !DISABLE_INCOMING
 		node.process_active (message_a.block);
 		rai::transaction transaction_a (node.store.environment, nullptr, false);
 		if (node.store.block_exists (transaction_a, message_a.block->hash ()))
 		{
 			confirm_block (transaction_a, node, sender, message_a.block);
 		}
+#endif
 	}
 	void confirm_ack (rai::confirm_ack const & message_a) override
 	{
@@ -378,6 +384,7 @@ public:
 		++node.network.incoming.confirm_ack;
 		node.peers.contacted (sender, message_a.version_using);
 		node.peers.insert (sender, message_a.version_using);
+#if !DISABLE_INCOMING
 		node.process_active (message_a.vote->block);
 		auto vote (node.vote_processor.vote (message_a.vote, sender));
 		if (vote.code == rai::vote_code::replay)
@@ -397,6 +404,7 @@ public:
 				node.network.confirm_send (confirm, bytes, sender);
 			}
 		}
+#endif
 	}
 	void bulk_pull (rai::bulk_pull const &) override
 	{
@@ -1129,10 +1137,14 @@ void rai::block_processor::process_blocks ()
 		{
 			std::deque<rai::block_processor_item> blocks_processing;
 			std::swap (blocks, blocks_processing);
+			int count = (int)blocks_processing.size();
+			printf("BLOCK QUEUE IS %i\n", count);
 			lock.unlock ();
 			process_receive_many (blocks_processing);
 			// Let other threads get an opportunity to transaction lock
-			std::this_thread::yield ();
+			if (count < 1024) {
+				sleep(3);
+			}
 			lock.lock ();
 		}
 		else
@@ -1175,7 +1187,7 @@ void rai::block_processor::process_receive_many (std::deque<rai::block_processor
 						node.ledger.rollback (transaction, successor->hash ());
 					}
 				}
-				auto process_result (process_receive_one (transaction, item.block));
+				auto process_result (process_receive_one (transaction, item));
 				if (item.callback)
 				{
 					item.callback (transaction, process_result, item.block);
@@ -1188,12 +1200,14 @@ void rai::block_processor::process_receive_many (std::deque<rai::block_processor
 					}
 					case rai::process_result::old:
 					{
-						auto cached (node.store.unchecked_get (transaction, hash));
-						for (auto i (cached.begin ()), n (cached.end ()); i != n; ++i)
-						{
-							node.store.unchecked_del (transaction, hash, **i);
-							blocks_processing.push_front (rai::block_processor_item (*i));
+						node.store.cache_mutex.lock();
+						auto range = node.store.unchecked_cache.equal_range(hash);
+						for (auto i = range.first; i != range.second; ++i) {
+							// BOOST_LOG (node.log) << boost::str (boost::format ("RECHECK GAP FOR: %1%, with gaphash %2%") % i->second.block->hash ().to_string () % hash.to_string ());
+							blocks_processing.push_front (rai::block_processor_item (i->second.block, i->second.callback));
 						}
+						node.store.unchecked_cache.erase (hash);
+						node.store.cache_mutex.unlock();
 						std::lock_guard<std::mutex> lock (node.gap_cache.mutex);
 						node.gap_cache.blocks.get<1> ().erase (hash);
 						break;
@@ -1218,8 +1232,9 @@ void rai::block_processor::process_receive_many (std::deque<rai::block_processor
 	}
 }
 
-rai::process_return rai::block_processor::process_receive_one (MDB_txn * transaction_a, std::shared_ptr<rai::block> block_a)
+rai::process_return rai::block_processor::process_receive_one (MDB_txn * transaction_a, rai::block_processor_item & item)
 {
+	auto block_a = item.block;
 	rai::process_return result;
 	result = node.ledger.process (transaction_a, *block_a);
 	switch (result.code)
@@ -1236,22 +1251,30 @@ rai::process_return rai::block_processor::process_receive_one (MDB_txn * transac
 		}
 		case rai::process_result::gap_previous:
 		{
-			if (node.config.logging.ledger_logging ())
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("Gap previous for: %1%") % block_a->hash ().to_string ());
-			}
-			node.store.unchecked_put (transaction_a, block_a->previous (), block_a);
+			// if (node.config.logging.ledger_logging ())
+			// {
+				// BOOST_LOG (node.log) << boost::str (boost::format ("Gap previous for: %1% , with prev %2%") % block_a->hash ().to_string () % block_a->previous ().to_string ());
+			// }
+			rai::unchecked_item a;
+			a.block = item.block;
+			a.callback = item.callback;
 			node.gap_cache.add (transaction_a, block_a);
+			std::lock_guard<std::mutex> lock (node.store.cache_mutex);
+			node.store.unchecked_cache.insert (std::make_pair (block_a->previous(), a));
 			break;
 		}
 		case rai::process_result::gap_source:
 		{
-			if (node.config.logging.ledger_logging ())
-			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("Gap source for: %1%") % block_a->hash ().to_string ());
-			}
-			node.store.unchecked_put (transaction_a, block_a->source (), block_a);
+			// if (node.config.logging.ledger_logging ())
+			// {
+				// BOOST_LOG (node.log) << boost::str (boost::format ("Gap source for: %1%, with source %2%") % block_a->hash ().to_string () % block_a->source ().to_string ());
+			// }
+			rai::unchecked_item a;
+			a.block = item.block;
+			a.callback = item.callback;
 			node.gap_cache.add (transaction_a, block_a);
+			std::lock_guard<std::mutex> lock (node.store.cache_mutex);
+			node.store.unchecked_cache.insert (std::make_pair (block_a->source(), a));
 			break;
 		}
 		case rai::process_result::old:
