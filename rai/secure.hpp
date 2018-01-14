@@ -6,6 +6,7 @@
 #include <boost/property_tree/ptree.hpp>
 
 #include <unordered_map>
+#include <unordered_set>
 
 #include <blake2/blake2.h>
 
@@ -170,6 +171,34 @@ public:
 	rai::vote_code code;
 	std::shared_ptr<rai::vote> vote;
 };
+enum class process_result
+{
+	progress, // Hasn't been seen before, signed correctly
+	bad_signature, // Signature was bad, forged or transmission error
+	old, // Already seen and was valid
+	overspend, // Malicious attempt to overspend
+	fork, // Malicious fork based on previous
+	unreceivable, // Source block doesn't exist or has already been received
+	gap_previous, // Block marked as previous is unknown
+	gap_source, // Block marked as source is unknown
+	not_receive_from_send, // Receive does not have a send source
+	account_mismatch, // Account number in open block doesn't match send destination
+	opened_burn_account // The impossible happened, someone found the private key associated with the public key '0'.
+};
+
+class process_return
+{
+public:
+	rai::process_result code;
+	rai::account account;
+	rai::amount amount;
+};
+struct unchecked_item
+{
+	std::shared_ptr<rai::block> block;
+	std::function<void(MDB_txn *, process_return, std::shared_ptr<rai::block>)> callback;
+};
+
 class block_store
 {
 public:
@@ -234,7 +263,8 @@ public:
 	rai::store_iterator unchecked_begin (MDB_txn *, rai::block_hash const &);
 	rai::store_iterator unchecked_end ();
 	size_t unchecked_count (MDB_txn *);
-	std::unordered_multimap<rai::block_hash, std::shared_ptr<rai::block>> unchecked_cache;
+	std::unordered_multimap<rai::block_hash, unchecked_item> unchecked_cache;
+	std::unordered_set<rai::block_hash> unchecked_cache_set;
 
 	void unsynced_put (MDB_txn *, rai::block_hash const &);
 	void unsynced_del (MDB_txn *, rai::block_hash const &);
@@ -307,28 +337,7 @@ public:
 	// uint256_union -> ?											// Meta information about block store
 	MDB_dbi meta;
 };
-enum class process_result
-{
-	progress, // Hasn't been seen before, signed correctly
-	bad_signature, // Signature was bad, forged or transmission error
-	old, // Already seen and was valid
-	overspend, // Malicious attempt to overspend
-	fork, // Malicious fork based on previous
-	unreceivable, // Source block doesn't exist or has already been received
-	gap_previous, // Block marked as previous is unknown
-	gap_source, // Block marked as source is unknown
-	not_receive_from_send, // Receive does not have a send source
-	account_mismatch, // Account number in open block doesn't match send destination
-	opened_burn_account // The impossible happened, someone found the private key associated with the public key '0'.
-};
-class process_return
-{
-public:
-	rai::process_result code;
-	rai::account account;
-	rai::amount amount;
-	rai::account pending_account;
-};
+
 enum class tally_result
 {
 	vote,

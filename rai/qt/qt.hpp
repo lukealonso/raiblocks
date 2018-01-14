@@ -275,6 +275,7 @@ public:
 	void set_text ();
 	std::string text ();
 	std::string color ();
+	void updateNext();
 	std::set<rai_qt::status_types> active;
 	rai_qt::wallet & wallet;
 };

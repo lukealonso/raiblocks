@@ -701,7 +701,15 @@ wallet (wallet_a)
 {
 	wallet.status->setToolTip ("Wallet status, block count (blocks downloaded)");
 	active.insert (rai_qt::status_types::nominal);
-	set_text ();
+	updateNext ();
+}
+
+void rai_qt::status::updateNext()
+{
+    set_text ();
+	QTimer::singleShot(1000, [this]() {
+    	updateNext();
+	});
 }
 
 void rai_qt::status::erase (rai_qt::status_types status_a)
@@ -724,6 +732,7 @@ void rai_qt::status::set_text ()
 	wallet.status->setText (text ().c_str ());
 	wallet.status->setStyleSheet ((std::string ("QLabel {") + color () + "}").c_str ());
 }
+
 
 std::string rai_qt::status::text ()
 {

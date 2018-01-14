@@ -2379,7 +2379,7 @@ void rai::rpc_handler::process ()
 			std::shared_ptr<rai::block> block_a (std::move (block));
 			{
 				rai::transaction transaction (node.store.environment, nullptr, true);
-				result = node.block_processor.process_receive_one (transaction, block_a);
+				// result = node.block_processor.process_receive_one (transaction, block_a);
 			}
 			switch (result.code)
 			{

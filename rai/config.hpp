@@ -16,5 +16,5 @@ enum class rai_networks
 	rai_live_network
 };
 rai::rai_networks const rai_network = rai_networks::ACTIVE_NETWORK;
-std::chrono::milliseconds const transaction_timeout = std::chrono::milliseconds (1000);
+std::chrono::milliseconds const transaction_timeout = std::chrono::milliseconds (3000);
 }
