@@ -1441,6 +1441,9 @@ void rai::block_store::unchecked_put (MDB_txn * transaction_a, rai::block_hash c
 
 std::vector<std::shared_ptr<rai::block>> rai::block_store::unchecked_get (MDB_txn * transaction_a, rai::block_hash const & hash_a)
 {
+	// std::vector<std::shared_ptr<rai::block>> result;
+	// assert(0);
+	// return result;
 	std::vector<std::shared_ptr<rai::block>> result;
 	{
 		std::lock_guard<std::mutex> lock (cache_mutex);
@@ -1502,11 +1505,12 @@ rai::store_iterator rai::block_store::unchecked_end ()
 
 size_t rai::block_store::unchecked_count (MDB_txn * transaction_a)
 {
+	std::lock_guard<std::mutex> lock (cache_mutex);
 	MDB_stat unchecked_stats;
 	auto status (mdb_stat (transaction_a, unchecked, &unchecked_stats));
 	assert (status == 0);
 	auto result (unchecked_stats.ms_entries);
-	return result;
+	return result + unchecked_cache.size();
 }
 
 void rai::block_store::unsynced_put (MDB_txn * transaction_a, rai::block_hash const & hash_a)
@@ -1582,12 +1586,13 @@ void rai::block_store::checksum_del (MDB_txn * transaction_a, uint64_t prefix, u
 
 void rai::block_store::flush (MDB_txn * transaction_a)
 {
-	std::unordered_map<rai::account, std::shared_ptr<rai::vote>> sequence_cache_l;
 	std::unordered_multimap<rai::block_hash, std::shared_ptr<rai::block>> unchecked_cache_l;
 	{
 		std::lock_guard<std::mutex> lock (cache_mutex);
-		sequence_cache_l.swap (vote_cache);
-		unchecked_cache_l.swap (unchecked_cache);
+		// if (unchecked_cache.size () > 128 * 1024)
+		// {
+			unchecked_cache_l.swap (unchecked_cache);
+		// }
 	}
 	for (auto & i : unchecked_cache_l)
 	{
@@ -1598,6 +1603,12 @@ void rai::block_store::flush (MDB_txn * transaction_a)
 		}
 		auto status (mdb_put (transaction_a, unchecked, rai::mdb_val (i.first), rai::mdb_val (vector.size (), vector.data ()), 0));
 		assert (status == 0);
+	}
+
+	std::unordered_map<rai::account, std::shared_ptr<rai::vote>> sequence_cache_l;
+	{
+		std::lock_guard<std::mutex> lock (cache_mutex);
+		sequence_cache_l.swap (vote_cache);
 	}
 	for (auto i (sequence_cache_l.begin ()), n (sequence_cache_l.end ()); i != n; ++i)
 	{
@@ -1956,6 +1967,11 @@ public:
 		{
 			ledger.store.block_info_del (transaction, hash);
 		}
+		{
+			std::lock_guard<std::mutex> lock (ledger.store.cache_mutex);
+			std::cout << hash.to_string() << " erase\n";
+			ledger.store.fork_history.insert(hash);
+		}
 	}
 	void receive_block (rai::receive_block const & block_a) override
 	{
@@ -1977,6 +1993,11 @@ public:
 		{
 			ledger.store.block_info_del (transaction, hash);
 		}
+		{
+			std::lock_guard<std::mutex> lock (ledger.store.cache_mutex);
+			std::cout << hash.to_string() << " erase\n";
+			ledger.store.fork_history.insert(hash);
+		}
 	}
 	void open_block (rai::open_block const & block_a) override
 	{
@@ -1988,6 +2009,11 @@ public:
 		ledger.store.block_del (transaction, hash);
 		ledger.store.pending_put (transaction, rai::pending_key (destination_account, block_a.hashables.source), { ledger.account (transaction, block_a.hashables.source), amount });
 		ledger.store.frontier_del (transaction, hash);
+		{
+			std::lock_guard<std::mutex> lock (ledger.store.cache_mutex);
+			std::cout << hash.to_string() << " erase\n";
+			ledger.store.fork_history.insert(hash);
+		}
 	}
 	void change_block (rai::change_block const & block_a) override
 	{
@@ -2008,6 +2034,11 @@ public:
 		if (!(info.block_count % ledger.store.block_info_max))
 		{
 			ledger.store.block_info_del (transaction, hash);
+		}
+		{
+			std::lock_guard<std::mutex> lock (ledger.store.cache_mutex);
+			std::cout << hash.to_string() << " erase\n";
+			ledger.store.fork_history.insert(hash);
 		}
 	}
 	MDB_txn * transaction;

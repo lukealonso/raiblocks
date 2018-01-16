@@ -5,6 +5,9 @@
 
 #include <boost/log/trivial.hpp>
 
+std::unordered_map<rai::block_hash, std::shared_ptr<rai::block>> seen_blocks;
+FILE* dump_file = NULL;
+
 rai::block_synchronization::block_synchronization (boost::log::sources::logger_mt & log_a) :
 log (log_a)
 {
@@ -152,19 +155,46 @@ node (node_a),
 attempt (attempt_a),
 socket (node_a->service),
 endpoint (endpoint_a),
-timeout (node_a->service)
+timeout (node_a->service),
+block_count (0),
+pending_stop (false),
+hard_stop(false)
 {
 	++attempt->connections;
 }
+
 
 rai::bootstrap_client::~bootstrap_client ()
 {
 	--attempt->connections;
 }
 
+double rai::bootstrap_client::block_rate () const
+{
+	auto elapsed = elapsed_seconds ();
+	if (elapsed > 0.0)
+	{
+		return (double)block_count.load () / elapsed;
+	}
+	return 0.0;
+}
+
+double rai::bootstrap_client::elapsed_seconds() const
+{
+	return std::chrono::duration_cast<std::chrono::duration<double>> (std::chrono::steady_clock::now () - start_time).count ();
+}
+
+void rai::bootstrap_client::stop (bool force)
+{
+	pending_stop = true;
+	if (force) {
+		hard_stop = true;
+	}
+}
+
 void rai::bootstrap_client::start_timeout ()
 {
-	timeout.expires_from_now (boost::posix_time::seconds (15));
+	timeout.expires_from_now (boost::posix_time::seconds (3));
 	std::weak_ptr<rai::bootstrap_client> this_w (shared ());
 	timeout.async_wait ([this_w](boost::system::error_code const & ec) {
 		if (ec != boost::asio::error::operation_aborted)
@@ -256,8 +286,6 @@ rai::frontier_req_client::frontier_req_client (std::shared_ptr<rai::bootstrap_cl
 connection (connection_a),
 current (0),
 count (0),
-landing ("059F68AAB29DE0D3A27443625C7EA9CDDB6517A8B76FE37727EF6A4D76832AD5"),
-faucet ("8E319CE6F3025E5B2DF66DA7AB1467FE48F1679C13DD43BFDB29FA2E9FC40D3B"),
 next_report (std::chrono::system_clock::now () + std::chrono::seconds (15))
 {
 	rai::transaction transaction (connection->node->store.environment, nullptr, false);
@@ -276,22 +304,6 @@ void rai::frontier_req_client::receive_frontier ()
 		this_l->connection->stop_timeout ();
 		this_l->received_frontier (ec, size_a);
 	});
-}
-
-void rai::frontier_req_client::request_account (rai::account const & account_a, rai::block_hash const & latest_a)
-{
-	// Account they know about and we don't.
-	rai::account account_1 ("6B31E80CABDD2FEE6F54A7BDBF91B666010418F4438EF0B48168F93CD79DBC85"); // xrb_1tsjx18cqqbhxsqobbxxqyauesi31iehaiwgy4ta4t9s9mdsuh671npo1st9
-	rai::account account_2 ("FD6EE9E0E107A6A8584DB94A3F154799DD5C2A7D6ABED0889DA3B837B0E61663"); // xrb_3zdgx9ig43x8o3e6ugcc9wcnh8gxdio9ttoyt46buaxr8yrge7m5331qdwhk
-	if (account_a != landing && account_a != faucet && account_a != account_1 && account_a != account_2)
-	{
-		insert_pull (rai::pull_info (account_a, latest_a, rai::block_hash (0)));
-	}
-	else
-	{
-		std::lock_guard<std::mutex> lock (connection->attempt->mutex);
-		connection->attempt->pulls.push_front (rai::pull_info (account_a, latest_a, rai::block_hash (0)));
-	}
 }
 
 void rai::frontier_req_client::unsynced (MDB_txn * transaction_a, rai::block_hash const & ours_a, rai::block_hash const & theirs_a)
@@ -318,12 +330,26 @@ void rai::frontier_req_client::received_frontier (boost::system::error_code cons
 		rai::bufferstream latest_stream (connection->receive_buffer.data () + sizeof (rai::uint256_union), sizeof (rai::uint256_union));
 		auto error2 (rai::read (latest_stream, latest));
 		assert (!error2);
+		if (count == 0)
+		{
+			start_time = std::chrono::steady_clock::now ();
+		}
 		++count;
 		auto now (std::chrono::system_clock::now ());
 		if (next_report < now)
 		{
 			next_report = now + std::chrono::seconds (15);
 			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Received %1% frontiers from %2%") % std::to_string (count) % connection->socket.remote_endpoint ());
+		}
+		std::chrono::duration<double> time_span = std::chrono::duration_cast<std::chrono::duration<double>> (std::chrono::steady_clock::now () - start_time);
+		double elapsed = time_span.count ();
+		double rate = (double)count / elapsed;
+		// TODO - make configurable
+		if (elapsed > 5 && rate < 10000)
+		{
+			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Aborting frontier req because it was too slow"));
+			promise.set_value (true);
+			return;
 		}
 		if (!account.is_zero ())
 		{
@@ -358,15 +384,7 @@ void rai::frontier_req_client::received_frontier (boost::system::error_code cons
 						}
 						else
 						{
-							// They know about a block we don't.
-							if (account != rai::genesis_account && account != landing && account != faucet)
-							{
-								insert_pull (rai::pull_info (account, latest, info.head));
-							}
-							else
-							{
-								connection->attempt->pulls.push_front (rai::pull_info (account, latest, info.head));
-							}
+							connection->attempt->add_pull (rai::pull_info (account, latest, info.head));
 						}
 					}
 					next (transaction);
@@ -374,12 +392,12 @@ void rai::frontier_req_client::received_frontier (boost::system::error_code cons
 				else
 				{
 					assert (account < current);
-					request_account (account, latest);
+					connection->attempt->add_pull (rai::pull_info (account, latest, rai::block_hash (0)));
 				}
 			}
 			else
 			{
-				request_account (account, latest);
+				connection->attempt->add_pull (rai::pull_info (account, latest, rai::block_hash (0)));
 			}
 			receive_frontier ();
 		}
@@ -416,12 +434,6 @@ void rai::frontier_req_client::received_frontier (boost::system::error_code cons
 			BOOST_LOG (connection->node->log) << boost::str (boost::format ("Error while receiving frontier %1%") % ec.message ());
 		}
 	}
-}
-
-void rai::frontier_req_client::insert_pull (rai::pull_info const & pull_a)
-{
-	std::lock_guard<std::mutex> lock (connection->attempt->mutex);
-	connection->attempt->pulls.insert (connection->attempt->pulls.begin () + rai::random_pool.GenerateWord32 (0, connection->attempt->pulls.size ()), pull_a);
 }
 
 void rai::frontier_req_client::next (MDB_txn * transaction_a)
@@ -555,10 +567,18 @@ void rai::bulk_pull_client::received_type ()
 		}
 		case rai::block_type::not_a_block:
 		{
-			connection->attempt->pool_connection (connection);
+			if (!connection->pending_stop && expected == pull.end)
+			{
+				connection->attempt->pool_connection (connection);
+			}
 			if (expected == pull.end)
 			{
+				// logfile << "account pull for " << pull.account.to_account () << " complete\n";
 				pull = rai::pull_info ();
+			}
+			else
+			{
+				BOOST_LOG (connection->node->log) << boost::str (boost::format ("Dropped connection because they didn't send us what we expected for account : %1%") % pull.account.to_string ());
 			}
 			break;
 		}
@@ -589,33 +609,33 @@ void rai::bulk_pull_client::received_block (boost::system::error_code const & ec
 			{
 				expected = block->previous ();
 			}
+			else
+			{
+				return;
+			}
 			auto attempt_l (connection->attempt);
 			auto pull_l (pull);
-			attempt_l->node->block_processor.add (rai::block_processor_item (block, [attempt_l, pull_l](MDB_txn * transaction_a, rai::process_return result_a, std::shared_ptr<rai::block> block_a) {
-				switch (result_a.code)
-				{
-					case rai::process_result::progress:
-					case rai::process_result::old:
-						break;
-					case rai::process_result::fork:
-					{
-						auto node_l (attempt_l->node);
-						std::shared_ptr<rai::block> block (node_l->ledger.forked_block (transaction_a, *block_a));
-						if (!node_l->active.start (transaction_a, block))
-						{
-							node_l->network.broadcast_confirm_req (block_a);
-							node_l->network.broadcast_confirm_req (block);
-							auto hash (block_a->hash ());
-							attempt_l->requeue_pull (rai::pull_info (pull_l.account, hash, hash));
-							BOOST_LOG (node_l->log) << boost::str (boost::format ("While bootstrappping, fork between our block: %2% and block %1% both with root %3%") % block_a->hash ().to_string () % block->hash ().to_string () % block_a->root ().to_string ());
-						}
-						break;
-					}
-					default:
-						break;
+			// assert (size_a == 132 || size_a == 152 || size_a == 168);
+			// assert (dumpfile.is_open ());
+			// dumpfile.write ((const char *)connection->receive_buffer.data (), 1 + size_a);
+			if (connection->block_count++ == 0)
+			{
+				// logfile << "account pull for " << pull.account.to_account () << " started\n";
+				connection->start_time = std::chrono::steady_clock::now ();
+			}
+			{
+				std::lock_guard<std::mutex> lock (attempt_l->mutex);
+				if (dump_file == NULL) {
+					dump_file = fopen("/Users/luke/Desktop/blocks.bin", "wb");
 				}
-			}));
-			receive_block ();
+				fwrite(connection->receive_buffer.data (), size_a + 1, 1, dump_file);
+				seen_blocks[hash] = block;
+				attempt_l->total_blocks++;
+			}
+			attempt_l->node->block_processor.add (rai::block_processor_item (block));
+			if (!connection->hard_stop.load()) {
+				receive_block ();
+			}
 		}
 		else
 		{
@@ -765,6 +785,7 @@ connections (0),
 pulling (0),
 node (node_a),
 account_count (0),
+total_blocks (0),
 stopped (false)
 {
 	BOOST_LOG (node->log) << "Starting bootstrap attempt";
@@ -865,8 +886,315 @@ bool rai::bootstrap_attempt::still_pulling ()
 	return running && (more_pulls || still_pulling);
 }
 
+struct dag_node {
+
+	dag_node (const rai::block_hash & hash_a, std::shared_ptr<rai::block> block_a)
+		: block(block_a)
+		, hash(hash_a)
+		, island(0)
+	{
+	}
+
+	rai::block_hash hash;
+	std::shared_ptr<rai::block> block;
+	std::shared_ptr<dag_node> parents[8];
+	std::shared_ptr<dag_node> children[8];
+	int island;
+
+	void link_parent(std::shared_ptr<dag_node> parent) {
+		assert(block->previous() == parent->hash || block->source() == parent->hash);
+		for (int i = 0; i < 8; i++) {
+			if (parents[i] == nullptr) {
+				parents[i] = parent;
+				return;
+			}
+		}
+		*(int*)123 = 0;
+	}
+
+	void link_child(std::shared_ptr<dag_node> child) {
+		assert(child->block->previous() == hash || child->block->source() == hash);
+		for (int i = 0; i < 8; i++) {
+			if (children[i] == nullptr) {
+				children[i] = child;
+				return;
+			}
+		}
+		*(int*)123 = 0;
+	}
+
+	bool deps_resolved() {
+		static rai::block_hash genesis_hash = rai::block_hash("991CF190094C00F0B68E2E5F75F6BEE95A2E0BD93CEAA4A6734DB9F19B728948");
+		if (block->hash() == genesis_hash) {
+			return true;
+		}
+		int expected = (!block->previous().is_zero() ? 1 : 0) + (!block->source().is_zero() ? 1 : 0);
+		int have = (parents[0] != nullptr ? 1 : 0) + (parents[1] != nullptr ? 1 : 0);
+		return expected == have;
+	}
+};
+
+void walk_graph(std::shared_ptr<dag_node> node, int island) {
+	std::vector<dag_node*> search;
+	search.push_back(node.get());
+	while (search.size() > 0) {
+		std::vector<dag_node*> next;
+		for (auto & n : search) {
+			int parentDeps = 0;
+			bool invalid = false;
+			for (int i = 0; i < 8; i++) {
+				if (n->parents[i] != nullptr) {
+					if (n->parents[i]->island != island) {
+						invalid = true;
+						break;
+					}
+				}
+			}
+			if (invalid) {
+				continue;
+			}
+			if (n->deps_resolved() && n->island == 0) {
+				n->island = island;
+				for (int i = 0; i < 8; i++) {
+					if (n->children[i] != nullptr) {
+						next.push_back(n->children[i].get());
+					}
+				}
+			}
+		}
+		search.swap(next);
+	}
+}
+
+static rai::block_hash genesis_hash = rai::block_hash("991CF190094C00F0B68E2E5F75F6BEE95A2E0BD93CEAA4A6734DB9F19B728948");
+
+void debug_graph(std::shared_ptr<rai::block> genesis, std::unordered_map<rai::block_hash, std::shared_ptr<rai::block>> seen_blocks) {
+	printf("building node map...\n");
+
+	std::unordered_map<rai::block_hash, std::shared_ptr<dag_node>> nodes;
+	std::unordered_multimap<rai::block_hash, std::shared_ptr<dag_node>> nodeDeps;
+
+	for (auto & it : seen_blocks) {
+		auto & hash = it.first;
+		auto & block = it.second;
+		auto n = std::make_shared<dag_node>(hash, block);
+		nodes[hash] = n;
+		auto prev = block->previous();
+		auto src = block->source();
+		if (!prev.is_zero()) {
+			nodeDeps.insert(std::make_pair (prev, n));
+		}
+		if (!src.is_zero()) {
+			nodeDeps.insert(std::make_pair (src, n));
+		}
+	}
+
+	if (nodes.find(genesis_hash) == nodes.end()) {
+		auto genesis_node = std::make_shared<dag_node>(genesis_hash, genesis);
+		nodes[genesis_hash] = genesis_node;
+	}
+
+	auto genesis_node = nodes[genesis_hash];
+	
+	printf("built node map. have %i nodes\n", nodes.size());
+	printf("linking graph...\n");
+
+	for (auto & it : nodes) {
+		auto & node = it.second;
+		auto range = nodeDeps.equal_range(node->hash);
+		for (auto & i = range.first; i != range.second; ++i) {
+			auto & childNode = i->second;
+			node->link_child(childNode);
+			childNode->link_parent(node); 
+		}	
+	}
+
+	int unresolved = 0;
+	for (auto & it : nodes) {
+		auto & node = it.second;
+		if (!node->deps_resolved()) {
+			unresolved++;
+		}
+	}
+
+	printf("%i nodes with unresolved deps\n", unresolved);
+	
+	printf("walking graph from genesis...\n");
+
+	int reachable = 0;
+
+	if (genesis_node != nullptr) {
+		walk_graph(genesis_node, 1);
+		for (auto & it : nodes) {
+			auto & node = it.second;
+			if (node->island == 1) {
+				reachable++;
+			}
+		}
+
+	}
+
+	printf("%d nodes reachable from genesis...\n", reachable);
+}
+
+void rai::bootstrap_attempt::process_fork (MDB_txn * transaction_a, std::shared_ptr<rai::block> block_a)
+{
+	assert(!mutex.try_lock(mutex));
+	std::weak_ptr<rai::bootstrap_attempt> this_w (shared_from_this ());
+	std::shared_ptr<rai::block> ledger_block (node->ledger.forked_block (transaction_a, *block_a));
+	node->active.start (transaction_a, ledger_block, [this_w, block_a](std::shared_ptr<rai::block>, size_t num_votes) {
+		if (auto this_l = this_w.lock ())
+		{
+			printf("****** VOTE RESOLVED WITH %d votes\n", num_votes);
+			if (num_votes > 0) {
+				{
+					std::unique_lock<std::mutex> lock (this_l->mutex);
+					this_l->unprocessed_forks.erase(block_a->hash());
+				}
+				rai::transaction transaction (this_l->node->store.environment, nullptr, false);
+				auto account (this_l->node->ledger.store.frontier_get (transaction, block_a->root()));
+				if (!account.is_zero()) {
+					this_l->requeue_pull (rai::pull_info (account, block_a->root(), block_a->root()));
+				} else if (this_l->node->ledger.store.account_exists (transaction, block_a->root())) {
+					this_l->requeue_pull (rai::pull_info (block_a->root(), rai::block_hash(0), rai::block_hash(0)));
+				}
+			}
+		}
+	});
+
+	BOOST_LOG (node->log) << boost::str (boost::format ("While bootstrappping, fork between our block: %2% and block %1% both with root %3%") % ledger_block->hash ().to_string () % block_a->hash ().to_string () % block_a->root ().to_string ());
+	unprocessed_forks[block_a->hash()] = block_a;
+	node->network.broadcast_confirm_req (ledger_block);
+	node->network.broadcast_confirm_req (block_a);
+}
+
+void rai::bootstrap_attempt::reconcile() {
+	std::lock_guard<std::mutex> lock (mutex);
+
+	node->block_processor.flush();
+
+	std::lock_guard<std::mutex> lock2 (node->store.cache_mutex);
+
+	printf("extracting blocks from database...\n");
+
+	rai::transaction transaction (node->store.environment, nullptr, false);
+	std::unordered_map<rai::block_hash, std::shared_ptr<rai::block>> available_blocks;
+
+	std::shared_ptr<rai::block> genesis = move(node->ledger.store.block_get(transaction, genesis_hash));
+
+	for (auto & it : node->store.unchecked_cache) {
+		available_blocks[it.second->hash()] = it.second;
+	}
+	for (auto i (node->store.unchecked_begin (transaction)), n (node->store.unchecked_end ()); i != n; ++i)
+	{
+		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (i->second.data ()), i->second.size ());
+		auto block = rai::deserialize_block (stream);
+		auto hash = block->hash();
+		available_blocks[hash] = std::shared_ptr<rai::block>(move(block));
+	}
+	auto end = rai::store_iterator(nullptr);
+	for (auto iter = rai::store_iterator(transaction, node->ledger.store.open_blocks); iter != end; ++iter) {
+		auto hash = rai::block_hash(iter->first.uint256());
+		auto & value = iter->second;
+		if (value.size() != 0)
+		{
+			rai::bufferstream stream (reinterpret_cast<uint8_t const *> (value.data()), value.size());
+			auto block = rai::deserialize_block (stream, rai::block_type::open);
+			available_blocks[hash] = std::shared_ptr<rai::block>(move(block));
+		}
+	}
+	for (auto iter = rai::store_iterator(transaction, node->ledger.store.receive_blocks); iter != end; ++iter) {
+		auto hash = rai::block_hash(iter->first.uint256());
+		auto & value = iter->second;
+		if (value.size() != 0)
+		{
+			rai::bufferstream stream (reinterpret_cast<uint8_t const *> (value.data()), value.size());
+			auto block = rai::deserialize_block (stream, rai::block_type::receive);
+			available_blocks[hash] = std::shared_ptr<rai::block>(move(block));
+		}
+	}
+	for (auto iter = rai::store_iterator(transaction, node->ledger.store.change_blocks); iter != end; ++iter) {
+		auto hash = rai::block_hash(iter->first.uint256());
+		auto & value = iter->second;
+		if (value.size() != 0)
+		{
+			rai::bufferstream stream (reinterpret_cast<uint8_t const *> (value.data()), value.size());
+			auto block = rai::deserialize_block (stream, rai::block_type::change);
+			available_blocks[hash] = std::shared_ptr<rai::block>(move(block));
+		}
+	}
+	for (auto iter = rai::store_iterator(transaction, node->ledger.store.send_blocks); iter != end; ++iter) {
+		auto hash = rai::block_hash(iter->first.uint256());
+		auto & value = iter->second;
+		if (value.size() != 0)
+		{
+			rai::bufferstream stream (reinterpret_cast<uint8_t const *> (value.data()), value.size());
+			auto block = rai::deserialize_block (stream, rai::block_type::send);
+			available_blocks[hash] = std::shared_ptr<rai::block>(move(block));
+		}
+	}
+	
+	int drop = 0;
+	int fork = 0;
+	int reject = 0;
+	for (auto & it : seen_blocks) {
+		auto & hash = it.first;
+		auto & block = it.second;
+		if (available_blocks.find(hash) == available_blocks.end()) {
+			if (node->store.fork_history.find(hash) != node->store.fork_history.end()) {
+				fork++;
+			} else if (node->store.reject_history.find(hash) != node->store.reject_history.end()) {
+				reject++;
+			} else {
+				drop++;
+			}
+		}
+	}
+	printf("%i dropped, %i fork erased, %i rejected\n", drop, fork, reject);
+	printf("***** REFERENCE:\n");
+	debug_graph(genesis, seen_blocks);
+	printf("***** CURRENT:\n");
+	debug_graph(genesis, available_blocks);
+}
+
+#if 0
 void rai::bootstrap_attempt::run ()
 {
+	retrigger_forks ();
+	printf("**** RUN BOOTSTRAP\n");
+	FILE* f = fopen("/Users/luke/Desktop/blockss.bin", "rb");
+	while (1) {
+		char block[200];
+		if (fread(block, 1, 1, f) != 1) {
+			break;
+		}
+		int size = 0;
+		if ((rai::block_type)block[0] == rai::block_type::open) {
+			size = 168;
+		}
+		if ((rai::block_type)block[0] == rai::block_type::send) {
+			size = 152;
+		}
+		if ((rai::block_type)block[0] == rai::block_type::change || (rai::block_type)block[0] == rai::block_type::receive) {
+			size = 136;
+		}
+		if (fread(block + 1, size, 1, f) != 1) {
+			break;
+		}
+		rai::bufferstream stream ((uint8_t*)block, 1 + size);
+		auto block2 (rai::deserialize_block (stream));
+		node->block_processor.add (rai::block_processor_item (move(block2)));
+	}
+	printf("**** FLUSH\n");
+	node->block_processor.flush ();
+	printf("**** DONE\n");
+}
+
+#else
+
+void rai::bootstrap_attempt::run ()
+{
+	retrigger_forks();
 	populate_connections ();
 	std::unique_lock<std::mutex> lock (mutex);
 	auto frontier_failure (true);
@@ -874,6 +1202,7 @@ void rai::bootstrap_attempt::run ()
 	{
 		frontier_failure = request_frontier (lock);
 	}
+	int checks = 0;
 	while (still_pulling ())
 	{
 		while (still_pulling ())
@@ -881,6 +1210,13 @@ void rai::bootstrap_attempt::run ()
 			if (!pulls.empty ())
 			{
 				request_pull (lock);
+				// if (checks++ % 100000 == 0) {
+				// 	printf("**** RECONCILING\n");
+				// 	lock.unlock();
+				// 	reconcile();
+				// 	lock.lock();
+				// 	printf("**** DONE\n");
+				// }
 			}
 			else
 			{
@@ -894,10 +1230,28 @@ void rai::bootstrap_attempt::run ()
 		lock.lock ();
 		BOOST_LOG (node->log) << "Finished flushing unchecked blocks";
 	}
+	// printf("*** WAITING TO RESOLVE VOTES\n");
+	// 	while (unprocessed_forks.size() > 0) {
+	// 		lock.unlock ();
+	// 		sleep(1);
+	// 		lock.lock();
+	// 	}
+			// printf("*** DONE RESOLVE\n");
+		if (dump_file != NULL) {
+			fflush(dump_file);
+		}
+
+	printf("*** FINAL RECONCILE\n");
+	lock.unlock ();
+	reconcile();
+	lock.lock ();
+	// *(int*)123 = 0;
 	if (!stopped)
 	{
 		BOOST_LOG (node->log) << "Completed pulls";
 	}
+	std::unordered_multimap<rai::block_hash, std::shared_ptr<rai::block>> unchecked_cache;
+
 	auto push_failure (true);
 	while (!stopped && push_failure)
 	{
@@ -907,6 +1261,8 @@ void rai::bootstrap_attempt::run ()
 	condition.notify_all ();
 	idle.clear ();
 }
+
+#endif
 
 std::shared_ptr<rai::bootstrap_client> rai::bootstrap_attempt::connection (std::unique_lock<std::mutex> & lock_a)
 {
@@ -937,29 +1293,100 @@ bool rai::bootstrap_attempt::consume_future (std::future<bool> & future_a)
 	return result;
 }
 
-void rai::bootstrap_attempt::populate_connections ()
+struct block_rate_cmp
 {
-	if (connections < node->config.bootstrap_connections)
+	bool operator() (const std::shared_ptr<rai::bootstrap_client> & lhs, const std::shared_ptr<rai::bootstrap_client> & rhs) const
 	{
-		auto peer (node->peers.bootstrap_peer ());
-		if (peer != rai::endpoint (boost::asio::ip::address_v6::any (), 0))
-		{
-			auto client (std::make_shared<rai::bootstrap_client> (node, shared_from_this (), rai::tcp_endpoint (peer.address (), peer.port ())));
-			client->run ();
-			std::lock_guard<std::mutex> lock (mutex);
-			clients.push_back (client);
-		}
-		else
-		{
-			BOOST_LOG (node->log) << boost::str (boost::format ("Bootstrap stopped because there are no peers"));
-			stopped = true;
-			condition.notify_all ();
-		}
+		return lhs->block_rate () > rhs->block_rate ();
+	}
+};
+
+void rai::bootstrap_attempt::retrigger_forks ()
+{
+	printf("%d unprocessed forks\n", unprocessed_forks.size());
+	std::unique_lock<std::mutex> lock (mutex);
+	rai::transaction transaction (node->store.environment, nullptr, false);
+	for (auto & it : unprocessed_forks) {
+		process_fork(transaction, it.second);
 	}
 	if (!stopped)
 	{
 		std::weak_ptr<rai::bootstrap_attempt> this_w (shared_from_this ());
 		node->alarm.add (std::chrono::system_clock::now () + std::chrono::seconds (5), [this_w]() {
+			if (auto this_l = this_w.lock ())
+			{
+				this_l->retrigger_forks ();
+			}
+		});
+	}
+}
+
+void rai::bootstrap_attempt::populate_connections ()
+{
+	double rateSum = 0.0;
+	std::priority_queue<std::shared_ptr<rai::bootstrap_client>, std::vector<std::shared_ptr<rai::bootstrap_client>>, block_rate_cmp> sorted_connections;
+	{
+		std::unique_lock<std::mutex> lock (mutex);
+		for (auto & c : clients)
+		{
+			if (auto client = c.lock ())
+			{
+				double elapsed = client->elapsed_seconds();
+				auto rate = client->block_rate();
+				rateSum += rate;
+				// std::cout << "client rate is " << client->block_rate () << " " << client->block_count << "\n";
+				// TODO - make configurable
+				if (elapsed > 5.0) {
+					sorted_connections.push (client);
+				}
+				if (elapsed > 30 && rate < 10) {
+					client->stop (true);
+				}
+			}
+		}
+	}
+	if (sorted_connections.size () >= node->config.bootstrap_connections)
+	{
+		// TODO - make configurable
+		for (int i = 0; i < std::max(1U, node->config.bootstrap_connections / 4); i++)
+		{
+			// std::cout << "worst client rates are " << sorted_connections.top ()->block_rate () << "\n";
+			sorted_connections.top ()->stop (false);
+			sorted_connections.pop ();
+		}
+	}
+
+	{
+		std::unique_lock<std::mutex> lock (mutex);
+		printf ("connections: %i, rate: %.0f blocks/sec rem pulls: %d total blocks: %d\n", connections.load (), rateSum, pulls.size(), (int)total_blocks.load());
+	}
+	if (connections < node->config.bootstrap_connections)
+	{
+		// TODO - tune this better
+		auto delta = node->config.bootstrap_connections - connections;
+		// Not many peers respond, need to try to make more connections than we need.
+		for (int i = 0; i < delta * 3; i++)
+		{
+			auto peer (node->peers.bootstrap_peer ());
+			if (peer != rai::endpoint (boost::asio::ip::address_v6::any (), 0))
+			{
+				auto client (std::make_shared<rai::bootstrap_client> (node, shared_from_this (), rai::tcp_endpoint (peer.address (), peer.port ())));
+				client->run ();
+				std::lock_guard<std::mutex> lock (mutex);
+				clients.push_back (client);
+			}
+			else
+			{
+				BOOST_LOG (node->log) << boost::str (boost::format ("Bootstrap stopped because there are no peers"));
+				stopped = true;
+				condition.notify_all ();
+			}
+	}
+	}
+	if (!stopped)
+	{
+		std::weak_ptr<rai::bootstrap_attempt> this_w (shared_from_this ());
+		node->alarm.add (std::chrono::system_clock::now () + std::chrono::seconds (1), [this_w]() {
 			if (auto this_l = this_w.lock ())
 			{
 				this_l->populate_connections ();
@@ -977,7 +1404,7 @@ void rai::bootstrap_attempt::add_connection (rai::endpoint const & endpoint_a)
 void rai::bootstrap_attempt::pool_connection (std::shared_ptr<rai::bootstrap_client> client_a)
 {
 	std::lock_guard<std::mutex> lock (mutex);
-	idle.push_back (client_a);
+	idle.push_front (client_a);
 	condition.notify_all ();
 }
 
@@ -1015,10 +1442,30 @@ void rai::bootstrap_attempt::stop ()
 	}
 }
 
+void rai::bootstrap_attempt::add_pull (rai::pull_info const & pull)
+{
+	static rai::account landing ("059F68AAB29DE0D3A27443625C7EA9CDDB6517A8B76FE37727EF6A4D76832AD5");
+	static rai::account faucet ("8E319CE6F3025E5B2DF66DA7AB1467FE48F1679C13DD43BFDB29FA2E9FC40D3B");
+	static rai::account account_1 ("6B31E80CABDD2FEE6F54A7BDBF91B666010418F4438EF0B48168F93CD79DBC85"); // xrb_1tsjx18cqqbhxsqobbxxqyauesi31iehaiwgy4ta4t9s9mdsuh671npo1st9
+	static rai::account account_2 ("FD6EE9E0E107A6A8584DB94A3F154799DD5C2A7D6ABED0889DA3B837B0E61663"); // xrb_3zdgx9ig43x8o3e6ugcc9wcnh8gxdio9ttoyt46buaxr8yrge7m5331qdwhk
+
+	std::lock_guard<std::mutex> lock (mutex);
+	rai::pull_info pull2 = pull;
+	if (pull.account != rai::genesis_account && pull.account != landing && pull.account != faucet && pull.account != account_1 && pull.account != account_2)
+	{
+		pulls.push_back (pull2);
+	}
+	else
+	{
+		pulls.push_front (pull2);
+	}
+	condition.notify_all ();
+}
+
 void rai::bootstrap_attempt::requeue_pull (rai::pull_info const & pull_a)
 {
 	auto pull (pull_a);
-	if (++pull.attempts < 4)
+	if (++pull.attempts < 16)
 	{
 		std::lock_guard<std::mutex> lock (mutex);
 		pulls.push_front (pull);
@@ -1121,6 +1568,15 @@ void rai::bootstrap_initiator::notify_listeners (bool in_progress_a)
 	for (auto & i : observers)
 	{
 		i (in_progress_a);
+	}
+}
+
+void rai::bootstrap_initiator::process_fork (MDB_txn * transaction, std::shared_ptr<rai::block> block_a)
+{
+	std::unique_lock<std::mutex> lock (mutex);
+	if (attempt != nullptr)
+	{
+		attempt->process_fork (transaction, block_a);
 	}
 }
 

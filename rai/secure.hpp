@@ -6,6 +6,7 @@
 #include <boost/property_tree/ptree.hpp>
 
 #include <unordered_map>
+#include <unordered_set>
 
 #include <blake2/blake2.h>
 
@@ -235,6 +236,8 @@ public:
 	rai::store_iterator unchecked_end ();
 	size_t unchecked_count (MDB_txn *);
 	std::unordered_multimap<rai::block_hash, std::shared_ptr<rai::block>> unchecked_cache;
+	std::unordered_set<rai::block_hash> fork_history;
+	std::unordered_set<rai::block_hash> reject_history;
 
 	void unsynced_put (MDB_txn *, rai::block_hash const &);
 	void unsynced_del (MDB_txn *, rai::block_hash const &);
