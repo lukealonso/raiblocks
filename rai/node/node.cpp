@@ -2770,7 +2770,7 @@ void rai::election::confirm_once (MDB_txn * transaction_a)
 		auto winner_l (last_winner);
 		auto node_l (node.shared ());
 		auto confirmation_action_l (confirmation_action);
-		auto num_votes = votes.rep_votes.size();
+		auto num_votes = winner->first > minimum_threshold (transaction_a, node.ledger) ? 1 : 0;//votes.rep_votes.size();
 		node.background ([winner_l, confirmation_action_l, node_l, num_votes]() {
 			node_l->process_confirmed (winner_l);
 			confirmation_action_l (winner_l, num_votes);
