@@ -624,7 +624,7 @@ void rai::bulk_pull_client::received_block (boost::system::error_code const & ec
 				connection->start_time = std::chrono::steady_clock::now ();
 			}
 			{
-				// std::lock_guard<std::mutex> lock (attempt_l->mutex);
+				std::lock_guard<std::mutex> lock (attempt_l->mutex);
 				// if (dump_file == NULL) {
 				// 	dump_file = fopen("/Users/luke/Desktop/blocks.bin", "wb");
 				// }
