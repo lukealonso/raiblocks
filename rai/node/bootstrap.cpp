@@ -624,11 +624,11 @@ void rai::bulk_pull_client::received_block (boost::system::error_code const & ec
 				connection->start_time = std::chrono::steady_clock::now ();
 			}
 			{
-				std::lock_guard<std::mutex> lock (attempt_l->mutex);
-				if (dump_file == NULL) {
-					dump_file = fopen("/Users/luke/Desktop/blocks.bin", "wb");
-				}
-				fwrite(connection->receive_buffer.data (), size_a + 1, 1, dump_file);
+				// std::lock_guard<std::mutex> lock (attempt_l->mutex);
+				// if (dump_file == NULL) {
+				// 	dump_file = fopen("/Users/luke/Desktop/blocks.bin", "wb");
+				// }
+				// fwrite(connection->receive_buffer.data (), size_a + 1, 1, dump_file);
 				seen_blocks[hash] = block;
 				attempt_l->total_blocks++;
 			}
@@ -1039,7 +1039,6 @@ void debug_graph(std::shared_ptr<rai::block> genesis, std::unordered_map<rai::bl
 
 void rai::bootstrap_attempt::process_fork (MDB_txn * transaction_a, std::shared_ptr<rai::block> block_a)
 {
-	assert(!mutex.try_lock(mutex));
 	std::weak_ptr<rai::bootstrap_attempt> this_w (shared_from_this ());
 	std::shared_ptr<rai::block> ledger_block (node->ledger.forked_block (transaction_a, *block_a));
 	if (ledger_block) {
