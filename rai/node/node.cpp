@@ -1132,7 +1132,7 @@ void rai::block_processor::process_blocks ()
 			// Let other threads get an opportunity to transaction lock.
 			if (count < 1024)
 			{
-				sleep (1);
+				std::this_thread::sleep_for(std::chrono::seconds(1));;
 			}
 			lock.lock ();
 		}

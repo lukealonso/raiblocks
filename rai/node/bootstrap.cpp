@@ -1042,29 +1042,30 @@ void rai::bootstrap_attempt::process_fork (MDB_txn * transaction_a, std::shared_
 	assert(!mutex.try_lock(mutex));
 	std::weak_ptr<rai::bootstrap_attempt> this_w (shared_from_this ());
 	std::shared_ptr<rai::block> ledger_block (node->ledger.forked_block (transaction_a, *block_a));
-	node->active.start (transaction_a, ledger_block, [this_w, block_a](std::shared_ptr<rai::block>, size_t num_votes) {
-		if (auto this_l = this_w.lock ())
-		{
-			printf("****** VOTE RESOLVED WITH %d votes\n", num_votes);
-			if (num_votes > 0) {
-				{
-					std::unique_lock<std::mutex> lock (this_l->mutex);
-					this_l->unprocessed_forks.erase(block_a->hash());
-				}
-				rai::transaction transaction (this_l->node->store.environment, nullptr, false);
-				auto account (this_l->node->ledger.store.frontier_get (transaction, block_a->root()));
-				if (!account.is_zero()) {
-					this_l->requeue_pull (rai::pull_info (account, block_a->root(), block_a->root()));
-				} else if (this_l->node->ledger.store.account_exists (transaction, block_a->root())) {
-					this_l->requeue_pull (rai::pull_info (block_a->root(), rai::block_hash(0), rai::block_hash(0)));
+	if (ledger_block) {
+		node->active.start (transaction_a, ledger_block, [this_w, block_a](std::shared_ptr<rai::block>, size_t num_votes) {
+			if (auto this_l = this_w.lock ())
+			{
+				printf("****** VOTE RESOLVED WITH %d votes\n", num_votes);
+				if (num_votes > 0) {
+					{
+						std::unique_lock<std::mutex> lock (this_l->mutex);
+						this_l->unprocessed_forks.erase(block_a->hash());
+					}
+					rai::transaction transaction (this_l->node->store.environment, nullptr, false);
+					auto account (this_l->node->ledger.store.frontier_get (transaction, block_a->root()));
+					if (!account.is_zero()) {
+						this_l->requeue_pull (rai::pull_info (account, block_a->root(), block_a->root()));
+					} else if (this_l->node->ledger.store.account_exists (transaction, block_a->root())) {
+						this_l->requeue_pull (rai::pull_info (block_a->root(), rai::block_hash(0), rai::block_hash(0)));
+					}
 				}
 			}
-		}
-	});
-
-	BOOST_LOG (node->log) << boost::str (boost::format ("While bootstrappping, fork between our block: %2% and block %1% both with root %3%") % ledger_block->hash ().to_string () % block_a->hash ().to_string () % block_a->root ().to_string ());
-	unprocessed_forks[block_a->hash()] = block_a;
-	node->network.broadcast_confirm_req (ledger_block);
+		});
+		BOOST_LOG (node->log) << boost::str (boost::format ("While bootstrappping, fork between our block: %2% and block %1% both with root %3%") % ledger_block->hash ().to_string () % block_a->hash ().to_string () % block_a->root ().to_string ());
+		unprocessed_forks[block_a->hash()] = block_a;
+		node->network.broadcast_confirm_req (ledger_block);
+	}
 	node->network.broadcast_confirm_req (block_a);
 }
 
