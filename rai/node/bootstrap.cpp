@@ -1234,17 +1234,12 @@ void rai::bootstrap_attempt::run ()
 		lock.lock ();
 		BOOST_LOG (node->log) << "Finished flushing unchecked blocks";
 	}
-	// printf("*** WAITING TO RESOLVE VOTES\n");
-	// 	while (unprocessed_forks.size() > 0) {
-	// 		lock.unlock ();
-	// 		sleep(1);
-	// 		lock.lock();
-	// 	}
-			// printf("*** DONE RESOLVE\n");
-		if (dump_file != NULL) {
-			fflush(dump_file);
+	printf("*** WAITING TO RESOLVE VOTES\n");
+		while (unprocessed_forks.size() > 0) {
+			lock.unlock ();
+			std::this_thread::sleep_for(std::chrono::seconds(1));;
+			lock.lock();
 		}
-
 	printf("*** FINAL RECONCILE\n");
 	lock.unlock ();
 	reconcile();

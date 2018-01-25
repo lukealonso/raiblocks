@@ -32,7 +32,7 @@ int constexpr rai::port_mapping::mapping_timeout;
 int constexpr rai::port_mapping::check_timeout;
 unsigned constexpr rai::active_transactions::announce_interval_ms;
 
-#define DISABLE_INCOMING 0
+#define DISABLE_INCOMING 1
 
 rai::message_statistics::message_statistics () :
 keepalive (0),
@@ -386,6 +386,7 @@ public:
 		node.peers.insert (sender, message_a.version_using);
 #if !DISABLE_INCOMING
 		node.process_active (message_a.vote->block);
+#endif
 		auto vote (node.vote_processor.vote (message_a.vote, sender));
 		if (vote.code == rai::vote_code::replay)
 		{
@@ -404,7 +405,7 @@ public:
 				node.network.confirm_send (confirm, bytes, sender);
 			}
 		}
-#endif
+
 	}
 	void bulk_pull (rai::bulk_pull const &) override
 	{
@@ -2378,7 +2379,7 @@ void rai::peer_container::random_fill (std::array<rai::endpoint, 8> & target_a)
 std::vector<rai::peer_information> rai::peer_container::representatives (size_t count_a)
 {
 	std::vector<peer_information> result;
-	result.reserve (std::min (count_a, size_t (16)));
+	result.reserve (std::min (count_a, size_t (1024)));
 	std::lock_guard<std::mutex> lock (mutex);
 	for (auto i (peers.get<6> ().begin ()), n (peers.get<6> ().end ()); i != n && result.size () < count_a; ++i)
 	{
@@ -2741,7 +2742,7 @@ rai::uint128_t rai::election::quorum_threshold (MDB_txn * transaction_a, rai::le
 rai::uint128_t rai::election::minimum_threshold (MDB_txn * transaction_a, rai::ledger & ledger_a)
 {
 	// Minimum number of votes needed to change our ledger, underwhich we're probably disconnected
-	return 1;//ledger_a.supply (transaction_a) / 16;
+	return ledger_a.supply (transaction_a) / 64;
 }
 
 void rai::election::confirm_once (MDB_txn * transaction_a)
