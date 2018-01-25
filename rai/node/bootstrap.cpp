@@ -1201,10 +1201,10 @@ void rai::bootstrap_attempt::run ()
 	while (!stopped && frontier_failure)
 	{
 		frontier_failure = request_frontier (lock);
-		if (pulls.size() < 330000) {
-			pulls.clear ();
-			frontier_failure = true;
-		}
+		// if (pulls.size() < 330000) {
+		// 	pulls.clear ();
+		// 	frontier_failure = true;
+		// }
 	}
 	int checks = 0;
 	while (still_pulling ())
