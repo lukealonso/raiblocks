@@ -32,7 +32,7 @@ int constexpr rai::port_mapping::mapping_timeout;
 int constexpr rai::port_mapping::check_timeout;
 unsigned constexpr rai::active_transactions::announce_interval_ms;
 
-#define DISABLE_INCOMING 1
+#define DISABLE_INCOMING 0
 
 rai::message_statistics::message_statistics () :
 keepalive (0),
@@ -1250,7 +1250,7 @@ rai::process_return rai::block_processor::process_receive_one (MDB_txn * transac
 			}
 			node.store.unchecked_put (transaction_a, block_a->previous (), block_a);
 			node.gap_cache.add (transaction_a, block_a);
-			std::lock_guard<std::mutex> lock (node.store.cache_mutex);
+			//std::lock_guard<std::mutex> lock (node.store.cache_mutex);
 			// node.store.unchecked_cache.insert (std::make_pair (block_a->previous(), block_a));
 			break;
 		}
@@ -1262,7 +1262,7 @@ rai::process_return rai::block_processor::process_receive_one (MDB_txn * transac
 			}
 			node.store.unchecked_put (transaction_a, block_a->source (), block_a);
 			node.gap_cache.add (transaction_a, block_a);
-			std::lock_guard<std::mutex> lock (node.store.cache_mutex);
+			//std::lock_guard<std::mutex> lock (node.store.cache_mutex);
 			// node.store.unchecked_cache.insert (std::make_pair (block_a->previous(), block_a));
 			break;
 		}

@@ -609,10 +609,6 @@ void rai::bulk_pull_client::received_block (boost::system::error_code const & ec
 			{
 				expected = block->previous ();
 			}
-			else
-			{
-				return;
-			}
 			auto attempt_l (connection->attempt);
 			auto pull_l (pull);
 			// assert (size_a == 132 || size_a == 152 || size_a == 168);
