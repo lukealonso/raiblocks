@@ -418,7 +418,7 @@ void rai::frontier_req_client::received_frontier (boost::system::error_code cons
 			{
 				try
 				{
-					promise.set_value (false);
+					promise.set_value (count < 330000);
 				}
 				catch (std::future_error &)
 				{
