@@ -878,6 +878,19 @@ void rai::block_store::block_put (MDB_txn * transaction_a, rai::block_hash const
 	assert (block_a.previous ().is_zero () || block_successor (transaction_a, block_a.previous ()) == hash_a);
 }
 
+void rai::block_store::block_put_bulk (MDB_txn * transaction_a, rai::block_hash const & hash_a, rai::block const & block_a, rai::block_hash const & successor_a)
+{
+    std::vector<uint8_t> vector;
+    {
+        rai::vectorstream stream (vector);
+        block_a.serialize (stream);
+        rai::write (stream, successor_a.bytes);
+    }
+    rai::mdb_val val = { vector.size (), vector.data () };
+    auto status2 (mdb_put (transaction_a, block_database (block_a.type ()), rai::mdb_val (hash_a), &val.value, MDB_APPEND));
+    assert (status2 == 0);
+}
+
 MDB_val rai::block_store::block_get_raw (MDB_txn * transaction_a, rai::block_hash const & hash_a, rai::block_type & type_a)
 {
 	rai::mdb_val result;
@@ -1139,6 +1152,12 @@ void rai::block_store::frontier_put (MDB_txn * transaction_a, rai::block_hash co
 	assert (status == 0);
 }
 
+void rai::block_store::frontier_put_bulk (MDB_txn * transaction_a, rai::block_hash const & block_a, rai::account const & account_a)
+{
+    auto status (mdb_put (transaction_a, frontiers, rai::mdb_val (block_a), rai::mdb_val (account_a), MDB_APPEND));
+    assert (status == 0);
+}
+
 rai::account rai::block_store::frontier_get (MDB_txn * transaction_a, rai::block_hash const & block_a)
 {
 	rai::mdb_val value;
@@ -1171,6 +1190,12 @@ void rai::block_store::account_put (MDB_txn * transaction_a, rai::account const 
 {
 	auto status (mdb_put (transaction_a, accounts, rai::mdb_val (account_a), info_a.val (), 0));
 	assert (status == 0);
+}
+
+void rai::block_store::account_put_bulk (MDB_txn * transaction_a, rai::account const & account_a, rai::account_info const & info_a)
+{
+    auto status (mdb_put (transaction_a, accounts, rai::mdb_val (account_a), info_a.val (), MDB_APPEND));
+    assert (status == 0);
 }
 
 void rai::block_store::pending_put (MDB_txn * transaction_a, rai::pending_key const & key_a, rai::pending_info const & pending_a)
@@ -1446,6 +1471,13 @@ void rai::block_store::representation_put (MDB_txn * transaction_a, rai::account
 	rai::uint128_union rep (representation_a);
 	auto status (mdb_put (transaction_a, representation, rai::mdb_val (account_a), rai::mdb_val (rep), 0));
 	assert (status == 0);
+}
+
+void rai::block_store::representation_put_bulk (MDB_txn * transaction_a, rai::account const & account_a, rai::uint128_t const & representation_a)
+{
+    rai::uint128_union rep (representation_a);
+    auto status (mdb_put (transaction_a, representation, rai::mdb_val (account_a), rai::mdb_val (rep), MDB_APPEND));
+    assert (status == 0);
 }
 
 rai::store_iterator rai::block_store::representation_begin (MDB_txn * transaction_a)

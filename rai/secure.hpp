@@ -180,7 +180,8 @@ public:
 	MDB_dbi block_database (rai::block_type);
 	void block_put_raw (MDB_txn *, MDB_dbi, rai::block_hash const &, MDB_val);
 	void block_put (MDB_txn *, rai::block_hash const &, rai::block const &, rai::block_hash const & = rai::block_hash (0));
-	MDB_val block_get_raw (MDB_txn *, rai::block_hash const &, rai::block_type &);
+    void block_put_bulk (MDB_txn *, rai::block_hash const &, rai::block const &, rai::block_hash const &);
+    MDB_val block_get_raw (MDB_txn *, rai::block_hash const &, rai::block_type &);
 	rai::block_hash block_successor (MDB_txn *, rai::block_hash const &);
 	void block_successor_clear (MDB_txn *, rai::block_hash const &);
 	std::unique_ptr<rai::block> block_get (MDB_txn *, rai::block_hash const &);
@@ -192,12 +193,14 @@ public:
 	std::unordered_multimap<rai::block_hash, rai::block_hash> block_dependencies (MDB_txn *);
 
 	void frontier_put (MDB_txn *, rai::block_hash const &, rai::account const &);
+    void frontier_put_bulk (MDB_txn *, rai::block_hash const &, rai::account const &);
 	rai::account frontier_get (MDB_txn *, rai::block_hash const &);
 	void frontier_del (MDB_txn *, rai::block_hash const &);
 	size_t frontier_count (MDB_txn *);
 
 	void account_put (MDB_txn *, rai::account const &, rai::account_info const &);
-	bool account_get (MDB_txn *, rai::account const &, rai::account_info &);
+    void account_put_bulk (MDB_txn *, rai::account const &, rai::account_info const &);
+    bool account_get (MDB_txn *, rai::account const &, rai::account_info &);
 	void account_del (MDB_txn *, rai::account const &);
 	bool account_exists (MDB_txn *, rai::account const &);
 	rai::store_iterator latest_begin (MDB_txn *, rai::account const &);
@@ -224,7 +227,8 @@ public:
 
 	rai::uint128_t representation_get (MDB_txn *, rai::account const &);
 	void representation_put (MDB_txn *, rai::account const &, rai::uint128_t const &);
-	void representation_add (MDB_txn *, rai::account const &, rai::uint128_t const &);
+    void representation_put_bulk (MDB_txn *, rai::account const &, rai::uint128_t const &);
+    void representation_add (MDB_txn *, rai::account const &, rai::uint128_t const &);
 	rai::store_iterator representation_begin (MDB_txn *);
 	rai::store_iterator representation_end ();
 

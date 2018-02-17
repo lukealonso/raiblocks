@@ -69,6 +69,7 @@ public:
 };
 class frontier_req_client;
 class bulk_push_client;
+
 class bootstrap_attempt : public std::enable_shared_from_this<bootstrap_attempt>
 {
 public:
@@ -106,6 +107,7 @@ public:
 	bool stopped;
 	std::mutex mutex;
 	std::condition_variable condition;
+	std::function<void(std::shared_ptr<rai::block>)> block_sink;	
 };
 class frontier_req_client : public std::enable_shared_from_this<rai::frontier_req_client>
 {

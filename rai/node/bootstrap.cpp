@@ -880,6 +880,506 @@ bool rai::bootstrap_attempt::still_pulling ()
 	return running && (more_pulls || still_pulling || more_forks);
 }
 
+#define RT_ASSERT(x) do { if (!(x)) { fprintf(stderr, "assertion failed: %s in %s line %i\n", #x, __FUNCTION__, __LINE__); *(int*)123 = 0; } } while (0);
+
+rai::block_hash fork_blocks[] = { rai::block_hash("482D57B86F094DED165AF8218FF65592499FCBAD5D31E8C09F686755DD7A32F6") };
+
+class dag {
+public:
+    class dag_node;
+    class dag_account;
+    
+	dag() {
+		next_color = 1;
+		rai::genesis genesis;
+		genesis_block = move(genesis.open);
+		genesis_hash = genesis_block->hash();
+		add_block(genesis_block);
+	}
+
+	void add_block(std::shared_ptr<rai::block> block) {
+		auto hash = block->hash();
+        for (int i = 0; i < sizeof(fork_blocks) / sizeof(rai::block_hash); i++) {
+            if (fork_blocks[i] == hash) {
+                return;
+            }
+        }
+		if (nodes.find(hash) == nodes.end()) {
+			auto node = new dag_node(hash, block);
+			nodes[hash] = node;
+			auto prev = block->previous();
+			if (!prev.is_zero()) {
+                auto range = node_deps.equal_range(prev);
+                node_deps.insert(std::make_pair (prev, node));
+			}
+			auto src = block->source();
+			if (!src.is_zero()) {
+				node_deps.insert(std::make_pair (src, node));
+			}
+		}
+	}
+
+	void link() {
+		for (auto & it : nodes) {
+			auto & node = it.second;
+			auto range = node_deps.equal_range(node->hash);
+			for (auto & i = range.first; i != range.second; ++i) {
+				auto & child_node = i->second;
+				node->link_child(child_node);
+				child_node->link_parent(node); 
+			}
+		}
+	}
+
+	void prune() {
+		walk_graph(nodes[genesis_hash], [this](dag_node* node) {
+			int num_account_children = 0;
+			int num_lattice_children = 0;
+			for (int i = 0; i < node->num_children; i++) {
+				if (node->children[i]->block->previous() == node->hash) {
+					num_account_children++;
+				}
+				if (node->children[i]->block->source() == node->hash) {
+					num_lattice_children++;
+				}
+			}
+			switch (node->block->type()) {
+			case rai::block_type::open:
+				if (num_lattice_children > 0) {
+					printf("open block had lattice children, erasing\n");
+					node->unlink_lattice_children();
+				}
+				if (num_account_children > 1) {
+					printf("open block had too many account children, need to resolve forks\n");
+				}
+				break;
+			case rai::block_type::receive:
+				if (num_lattice_children > 0) {
+					printf("receive block had lattice children, erasing\n");
+					node->unlink_lattice_children();
+				}
+				if (num_account_children > 1) {
+					printf("receive block had too many account children, need to resolve forks\n");
+                    for (int i = 0; i < node->num_children; i++) {
+                        printf("\t%s\n", node->children[i]->hash.to_string().c_str());
+                    }
+				}
+				break;
+			case rai::block_type::send:
+                // TODO check receives match destination account
+				if (num_lattice_children > 1) {
+					printf("send block had too many lattice children, need to resolve forks\n");
+                    for (int i = 0; i < node->num_children; i++) {
+                        printf("\t%s\n", node->children[i]->hash.to_string().c_str());
+                    }
+				}
+				if (num_account_children > 1) {
+					printf("send block had too many account children, need to resolve forks\n");
+                    for (int i = 0; i < node->num_children; i++) {
+                        printf("\t%s\n", node->children[i]->hash.to_string().c_str());
+                    }
+				}
+				break;
+			case rai::block_type::change:
+				if (num_lattice_children > 0) {
+					printf("change block had lattice children, erasing\n");
+					node->unlink_lattice_children();
+				}
+				if (num_account_children > 1) {
+					printf("change block had too many account children, need to resolve forks\n");
+				}
+				break;
+			default:
+				RT_ASSERT(false);
+			}
+            return true;
+		});
+	}
+    
+    dag_account* get_account(const rai::account& key) {
+        auto acc = accounts.find(key);
+        if (acc == accounts.end()) {
+            auto newacc = new dag_account(key);
+            accounts[key] = newacc;
+            return newacc;
+        } else {
+            return acc->second;
+        }
+    }
+
+	void build_accounts() {
+        auto genesis_node = nodes[genesis_hash];
+        auto acc = new dag_account(genesis_node->block->root());
+        acc->representation = std::numeric_limits<rai::uint128_t>::max ();
+        accounts[genesis_node->block->root()] = acc;
+        genesis_node->balance = std::numeric_limits<rai::uint128_t>::max ();
+		walk_graph(nodes[genesis_hash], [this](dag_node* node) {
+            if (node->block->type() != rai::block_type::open) {
+                RT_ASSERT(node->account_parent);
+                RT_ASSERT(node->account_parent->account);
+                node->account_parent->account->add_node(node);
+            } else {
+                auto acc = accounts.find(node->block->root());
+                RT_ASSERT(acc != accounts.end());
+                RT_ASSERT(acc->second->open_node == nullptr);
+                acc->second->add_node(node);
+            }
+            
+			switch (node->block->type()) {
+			case rai::block_type::open:
+                {
+                    if (node->hash != genesis_hash) {
+                        // Propagate balance.
+                        RT_ASSERT(node->lattice_parent);
+                        auto delta = node->lattice_parent->balance_delta();
+                        node->balance = delta;
+                        
+                        // Balance was received, subtract it from pending.
+                        RT_ASSERT(node->account->pending >= delta);
+                        node->account->pending -= delta;
+                        node->account->remove_pending(node->lattice_parent->hash);
+
+                        // Add weight to our rep.
+                        auto repacc = get_account(node->account->rep_node->block->representative());
+                        repacc->representation += delta;
+                    }
+                    break;
+                }
+			case rai::block_type::receive:
+                {
+                    // Propagate balance.
+                    RT_ASSERT(node->lattice_parent);
+                    RT_ASSERT(node->account_parent);
+                    RT_ASSERT(node->lattice_parent->block->type() == rai::block_type::send);
+                    auto delta = node->lattice_parent->balance_delta();
+                    node->balance = node->account_parent->balance + delta;
+                    
+                    // Balance was received, remove it from pending.
+                    RT_ASSERT(node->account);
+                    RT_ASSERT(node->account->pending >= delta);
+                    node->account->pending -= delta;
+                    node->account->remove_pending(node->lattice_parent->hash);
+
+                    // Add our weight to our rep.
+                    auto repacc = get_account(node->account->rep_node->block->representative());
+                    repacc->representation += delta;
+                    break;
+                }
+			case rai::block_type::send:
+                {
+                    // Propagate balance.
+                    auto send = (rai::send_block*)node->block.get();
+                    RT_ASSERT(node->account_parent);
+                    RT_ASSERT(node->account_parent->balance >= send->hashables.balance.number());
+                    node->balance = send->hashables.balance.number();
+                    auto delta = node->balance_delta();
+                    
+                    // Add pending to dest account.
+                    auto acc = get_account(send->hashables.destination);
+                    acc->pending += delta;
+                    acc->add_pending(node->hash, node->account->account, delta);
+
+                    // Subtract our weight from our rep.
+                    auto repacc = get_account(node->account->rep_node->block->representative());
+                    RT_ASSERT(repacc->representation >= delta);
+                    repacc->representation -= delta;
+                    break;
+                }
+			case rai::block_type::change:
+                {
+                    // Propagate balance.
+                    RT_ASSERT(node->account_parent);
+                    node->balance = node->account_parent->balance;
+                    
+                    // Remove our weight from our old rep.
+                    auto prev_rep_acc = get_account(node->account->rep_node->block->representative());
+                    RT_ASSERT(prev_rep_acc->representation >= node->balance);
+                    prev_rep_acc->representation -= node->balance;
+                    
+                    node->account->change_rep(node);
+                    
+                    // Add our weight to the new rep.
+                    auto new_rep_acc = get_account(node->account->rep_node->block->representative());
+                    new_rep_acc->representation += node->balance;
+   
+                    break;
+                }
+			default:
+				RT_ASSERT(false);
+			}
+
+
+            return true;
+        });
+	}
+
+	void walk_graph(dag_node* root, std::function<bool(dag_node*)> fn) {
+        next_color++;
+		std::vector<dag_node*> nodes;
+        nodes.push_back(root);
+		while (nodes.size() > 0) {
+			std::vector<dag_node*> next;
+			for (auto & node : nodes) {
+				if (!node->account_parent && !node->block->previous().is_zero() && node->hash != genesis_hash) {
+					continue;
+				}
+				if (!node->lattice_parent && !node->block->source().is_zero() && node->hash != genesis_hash) {
+					continue;
+				}
+				if (node->account_parent && node->account_parent->color != next_color) {
+					continue;
+				}
+				if (node->lattice_parent && node->lattice_parent->color != next_color) {
+					continue;
+				}
+                if (node->color != next_color) {
+                    node->color = next_color;
+                    if (fn(node)) {
+						for (int i = 0; i < node->num_children; i++) {
+							next.push_back(node->children[i]);
+						}
+					}
+				}
+			}
+			nodes.swap(next);
+		}
+	}
+    
+    void serialize(rai::block_store & store) {
+        printf("preparing...\n");
+        rai::transaction transaction(store.environment, 0, true);
+        std::vector<rai::block_hash> sort_blocks;
+        std::vector<rai::account> sort_accounts;
+
+        for (auto & node : nodes) {
+            if (node.second->account) {
+                sort_blocks.push_back(node.first);
+            }
+        }
+        
+        for (auto & account : accounts) {
+            sort_accounts.push_back(account.first);
+        }
+        
+        printf("sorting...\n");
+        std::sort(sort_blocks.begin(), sort_blocks.end());
+        std::sort(sort_accounts.begin(), sort_accounts.end());
+
+        printf("serializing...\n");
+        printf("blocks...\n");
+        for (auto & hash : sort_blocks) {
+            auto node = nodes[hash];
+            auto block = node->block.get();
+            store.block_put_bulk(transaction, hash, *block, node->account_parent ? node->account_parent->hash : rai::block_hash(0));
+        }
+        printf("frontiers...\n");
+        for (auto & hash : sort_blocks) {
+            auto node = nodes[hash];
+            RT_ASSERT(node->account);
+            store.frontier_put_bulk(transaction, hash, node->account->account);
+        }
+        printf("accounts...\n");
+        for (auto & hash : sort_accounts) {
+            auto account = accounts[hash];
+            if (account->frontier_node != nullptr) {
+                rai::account_info info(account->frontier_node->hash, account->rep_node->hash, account->open_node->hash, account->frontier_node->balance, 0, account->block_count);
+                store.account_put_bulk(transaction, hash, info);
+            }
+        }
+        printf("representation...\n");
+        for (auto & hash : sort_accounts) {
+            auto account = accounts[hash];
+            if (account->frontier_node != nullptr) {
+                store.representation_put_bulk(transaction, hash, account->representation);
+            }
+        }
+        printf("pending...\n");
+        for (auto & hash : sort_accounts) {
+            auto account = accounts[hash];
+            if (account->frontier_node != nullptr) {
+                for (auto & pending : account->pending_blocks) {
+                    rai::pending_key key(hash, pending.first);
+                    rai::pending_info info(pending.second.first, pending.second.second);
+                    store.pending_put(transaction, key, info);
+                }
+            }
+        }
+        
+    }
+    
+	class dag_account {
+    public:
+        dag_account (rai::account acc)
+            : open_node(nullptr)
+            , account(acc)
+			, frontier_node(nullptr)
+            , block_count(0)
+            , pending(0)
+            , representation(0)
+		{
+		}
+
+		void add_node(dag_node* node) {
+            if (open_node == nullptr) {
+                open_node = node;
+                rep_node = node;
+            }
+			frontier_node = node;
+			node->account = this;
+            block_count++;
+		}
+        //
+        void change_rep(dag_node* node) {
+            rep_node = node;
+        }
+        
+        void add_pending(const rai::block_hash & block, const rai::account & account, const rai::uint128_t amount) {
+            pending_blocks[block] = { account, amount };
+        }
+        
+        void remove_pending(const rai::block_hash & block) {
+            pending_blocks.erase(block);
+        }
+
+		dag_node* open_node;
+		dag_node* frontier_node;
+        dag_node* rep_node;
+        rai::account account;
+        rai::uint128_t pending;
+        rai::uint128_t representation;
+        std::unordered_map<rai::block_hash, std::pair<rai::account, rai::uint128_t>> pending_blocks;
+        uint64_t block_count;
+    };
+
+	class dag_node {
+    public:
+		dag_node (const rai::block_hash & hash_a, std::shared_ptr<rai::block> block_a)
+			: block(block_a)
+			, hash(hash_a)
+			, account_parent(nullptr)
+			, lattice_parent(nullptr)
+			, account(nullptr)
+			, num_children(0)
+			, color(0)
+		{
+		}
+
+		rai::block_hash hash;
+		std::shared_ptr<rai::block> block;
+		dag_node* account_parent;
+		dag_node* lattice_parent;
+		dag_node* children[6];
+		dag_account* account;
+		rai::uint128_t balance;
+		uint8_t num_children;
+		uint8_t color;
+
+		void unlink_lattice_children() {
+			for (int i = num_children - 1; i >= 0 ; i--) {
+				if (children[i]->block->source() == hash) {
+					children[i] = nullptr;
+					std::swap(children[i], children[num_children - 1]);
+					num_children--;
+				}
+			}			
+		}
+
+		void link_parent(dag_node* parent) {
+			if (block->previous() == parent->hash) {
+				RT_ASSERT(!account_parent || (account_parent == parent && lattice_parent == parent));
+				account_parent = parent;
+			}
+            if (block->source() == parent->hash) {
+                RT_ASSERT(!lattice_parent || (account_parent == parent && lattice_parent == parent));
+				lattice_parent = parent;
+			}
+		}
+
+		void link_child(dag_node* child) {
+			RT_ASSERT(child->block->previous() == hash || child->block->source() == hash);
+            for (int i = 0; i < num_children; i++) {
+                if (children[i] == child) {
+                    return;
+                }
+            }
+			children[num_children] = child;
+			num_children++;
+			RT_ASSERT(num_children <= 6);
+		}
+
+		rai::uint128_t balance_delta() {
+			if (lattice_parent) {
+				return lattice_parent->balance_delta();
+			} else if (account_parent) {
+				if (balance > account_parent->balance) {
+					return balance - account_parent->balance;
+				} else {
+					return account_parent->balance - balance;
+				}
+			} else {
+				return 0;
+			}
+		}
+	};
+
+	rai::block_hash genesis_hash;
+	std::shared_ptr<rai::block> genesis_block;
+	std::unordered_map<rai::block_hash, dag_node*> nodes;
+	std::unordered_multimap<rai::block_hash, dag_node*> node_deps;
+	std::unordered_map<rai::account, dag_account*> accounts;
+	int next_color;
+};
+
+#if 0
+void rai::bootstrap_attempt::run ()
+{
+    auto d = std::make_shared<dag>();
+	FILE* f = fopen("/Users/luke/Desktop/blocksg.bin", "rb");
+    printf("loading...\n");
+	while (1) {
+		char block[200];
+		if (fread(block, 1, 1, f) != 1) {
+			break;
+		}
+		int size = 0;
+		if ((rai::block_type)block[0] == rai::block_type::open) {
+			size = 168;
+		}
+		if ((rai::block_type)block[0] == rai::block_type::send) {
+			size = 152;
+		}
+		if ((rai::block_type)block[0] == rai::block_type::change || (rai::block_type)block[0] == rai::block_type::receive) {
+			size = 136;
+		}
+		if (fread(block + 1, size, 1, f) != 1) {
+			break;
+		}
+		rai::bufferstream stream ((uint8_t*)block, 1 + size);
+		auto block2 (rai::deserialize_block (stream));
+		d->add_block(move(block2));
+	}
+    printf("linking...\n");
+	d->link();
+    printf("pruning...\n");
+	d->prune();
+    printf("building accounts...\n");
+	d->build_accounts();
+    rai::account acc;
+    acc.decode_account("xrb_13m81j7g1js7996w8tgpc6ywj1xhyhgtm3o38eueg4cxpr59wiymere7tykx");
+    auto accinfo = d->accounts[acc];
+    std::cout << "open: " << accinfo->open_node->hash.to_string() << "\n";
+    std::cout << "head: " << accinfo->frontier_node->hash.to_string() << "\n";
+    std::cout << "balance: " << rai::amount(accinfo->frontier_node->balance).format_balance(Mxrb_ratio, 0, true) << "\n";
+    std::cout << "pending: " << rai::amount(accinfo->pending).format_balance(Mxrb_ratio, 0, true) << "\n";
+    printf("serializing...\n");
+    unlink("/Users/luke/Desktop/blocks.ldb");
+    bool err = false;
+    block_store store(err, "/Users/luke/Desktop/blocks.ldb");
+    d->serialize(store);
+    printf("done\n");
+    exit(1);
+}
+#else
 void rai::bootstrap_attempt::run ()
 {
 	populate_connections ();
@@ -929,6 +1429,7 @@ void rai::bootstrap_attempt::run ()
 	condition.notify_all ();
 	idle.clear ();
 }
+#endif
 
 std::shared_ptr<rai::bootstrap_client> rai::bootstrap_attempt::connection (std::unique_lock<std::mutex> & lock_a)
 {
